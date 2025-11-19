@@ -1,0 +1,255 @@
+You are an expert in PowerShell automation for Hyper-V and NetApp ONTAP REST APIs.
+Generate TWO fully functional, production-grade PowerShell scripts using ALL requirements below.
+
+====================================================================
+SCRIPT 1: Export-HyperVVMConfig.ps1  (Daily VM Config Backup)
+====================================================================
+
+PURPOSE:
+    Export Hyper-V VM configuration metadata daily as XML files
+    and retain only the newest 30 days of backups.
+
+REQUIREMENTS:
+1. Script runs on a Windows Hyper-V host.
+2. Automatically create a folder named "VMConfigBackup" in the SAME directory as the script.
+3. For EACH VM on the host, export its configuration to XML using this exact structure:
+
+<VM>
+    <Name></Name>
+    <Generation></Generation>
+    <CPU></CPU>
+    <MemoryStartupBytes></MemoryStartupBytes>
+    <DynamicMemoryEnabled></DynamicMemoryEnabled>
+    <DynamicMemoryMinBytes></DynamicMemoryMinBytes>
+    <DynamicMemoryMaxBytes></DynamicMemoryMaxBytes>
+    <NetworkAdapters>
+        <Adapter>
+            <Name></Name>
+            <MacAddress></MacAddress>
+            <SwitchName></SwitchName>
+            <VLAN></VLAN>
+        </Adapter>
+    </NetworkAdapters>
+    <Disks>
+        <Disk>
+            <ControllerType></ControllerType>
+            <ControllerLocation></ControllerLocation>
+            <Path></Path>
+        </Disk>
+    </Disks>
+</VM>
+
+4. File naming format:
+       <VMName>_<yyyyMMdd_HHmmss>.xml
+
+5. Backup retention:
+       - Keep only backups from the most recent 30 days.
+       - Delete older XML files automatically.
+
+6. Script must NOT stop, pause, or interact with running VMs.
+   This is metadata-only.
+
+====================================================================
+SCRIPT 2: Restore-VMFromFlexClone.ps1  (Full VM Restore Automation)
+====================================================================
+
+PURPOSE:
+    Restore a VM by:
+      - Reading a saved XML config file
+      - Selecting a valid ONTAP snapshot
+      - Creating a FlexClone
+      - Creating a SMB3 share
+      - Scanning the FlexClone volume for the VM folder
+      - Rebuilding the VM (ALWAYS as a NEW VM)
+      - Attaching VHDX files from the FlexClone
+      - Optionally deleting the FlexClone afterward
+
+IMPORTANT:
+    This script must ALWAYS create a NEW VM.
+    It MUST NOT overwrite, delete, or modify the existing VM of the same name.
+
+====================================================================
+USER INPUT AT SCRIPT START
+====================================================================
+
+At launch, prompt user to enter:
+
+1. Cluster management IP or FQDN  
+       $ClusterMgmt
+
+2. ONTAP username  
+       $ONTAPUser
+
+3. ONTAP password (HIDDEN INPUT)  
+       $ONTAPPassword = Read-Host "Enter ONTAP password" -AsSecureString
+
+   Convert SecureString to plain ONLY for REST API headers.
+
+4. Ignore SSL/TLS certificate validation for ALL REST operations:
+       [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+5. Ask for the ONTAP source volume name hosting the VM folders.
+
+====================================================================
+REST API REQUIREMENTS
+====================================================================
+
+All ONTAP REST API calls must:
+
+- Use HTTPS  
+- Ignore certificate validation  
+- Use Basic Authentication  
+- Use Try/Catch error handling  
+- Use Invoke-RestMethod  
+- Produce descriptive status output via Write-Host  
+
+### Required REST Calls:
+
+Get volume UUID:
+    GET /api/storage/volumes?name=<volume>
+
+Get snapshots:
+    GET /api/storage/volumes/<uuid>/snapshots
+
+Snapshot filtering:
+    EXCLUDE names beginning with:
+        "vserver"
+        "snapmirror"
+
+Create FlexClone:
+    POST /api/storage/volumes
+    Body must include:
+    {
+        "name": "<clone_name>",
+        "clone": {
+            "parent_volume": { "name": "<source_volume>" },
+            "parent_snapshot": { "name": "<snapshot_name>" }
+        },
+        "nas": {
+            "path": "/<clone_name>"
+        }
+    }
+
+Create SMB3 share:
+    POST /api/protocols/smb/shares
+    Share name MUST be:
+        clone_<clone_volume_name>
+
+Delete FlexClone:
+    DELETE /api/storage/volumes/<uuid>
+
+====================================================================
+RESTORE WORKFLOW (DETAILED)
+====================================================================
+
+Step 1 — Select VM to restore
+-----------------------------
+- Read all XML files inside ./VMConfigBackup
+- Extract unique VM names
+- Ask the user to select a VM
+- Ask the user to select a specific timestamped XML for that VM
+
+Step 2 — Ask for ONTAP volume name
+----------------------------------
+- This is the parent volume containing the VM folders.
+
+Step 3 — Retrieve snapshot list (filtered)
+------------------------------------------
+- Query via REST
+- Remove snapshots beginning with "vserver" or "snapmirror"
+- Display selectable list to the user
+
+Step 4 — Create FlexClone
+--------------------------
+- FlexClone name format:
+      <source_volume>_clone_<last-3-milliseconds>
+
+- Junction path:
+      /<clone_name>
+
+- SMB Share name:
+      clone_<clone_name>
+
+Step 5 — Locate VM folder inside FlexClone
+-------------------------------------------
+The FlexClone contains multiple VM folders.
+
+Folder structure example:
+
+    \\<SVM>\clone_<clone_name>\<VMName>\
+
+Script must:
+- Validate directory exists
+- Locate all VHDX files within that folder
+
+Step 6 — Parse XML and Create NEW VM
+-------------------------------------
+Create a NEW VM using Hyper-V cmdlets:
+
+- New-VM  
+- Set-VMProcessor  
+- Set-VMMemory  
+- Add-VMNetworkAdapter  
+- Set-VMNetworkAdapter  
+- Set-VMNetworkAdapterVlan  
+- Add-VMHardDiskDrive  
+
+Restore:
+
+- Name
+- Generation
+- CPU count
+- MemoryStartupBytes
+- DynamicMemory parameters
+- NIC count + MAC + VLAN + SwitchName
+- Disk list (ControllerType, Location, Path)
+
+IMPORTANT:
+    This restore ALWAYS creates a NEW VM.
+    It must NOT affect the original VM.
+
+Step 7 — Display completion message
+-----------------------------------
+Print:
+
+"Restore complete. Please verify that the VM boots successfully."
+
+Step 8 — Optional FlexClone Cleanup
+-----------------------------------
+Prompt user:
+
+"Do you want to delete the FlexClone volume?
+ Please confirm that no virtual machines are currently running on this volume."
+
+If YES:
+    - Remove SMB share
+    - Delete FlexClone via REST
+
+If NO:
+    - Keep FlexClone
+
+====================================================================
+CODING & QUALITY REQUIREMENTS
+====================================================================
+
+- Use Write-Host with colors:
+      Green = success  
+      Yellow = warning  
+      Red = error  
+
+- Use robust Try/Catch for ALL REST operations.
+- Include clear comments for readability.
+- Use descriptive variable names.
+- Scripts must run on Hyper-V host without modifications.
+- Scripts must be production quality.
+
+====================================================================
+OUTPUT FORMAT
+====================================================================
+
+Generate TWO files:
+
+1. Export-HyperVVMConfig.ps1
+2. Restore-VMFromFlexClone.ps1
+
+Both must be fully functional, complete, and implement ALL requirements above.
