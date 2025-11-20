@@ -49,7 +49,7 @@ $ONTAPPassword = Read-Host "Enter the ONTAP password" -AsSecureString
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 $plainPassword = Convert-SecureStringToPlainText -SecureString $ONTAPPassword
-$authHeader = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ONTAPUser:$plainPassword"))
+$authHeader = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($ONTAPUser):$plainPassword"))
 $baseUri = "https://$ClusterMgmt"
 
 function Invoke-OntapApi {
@@ -97,7 +97,7 @@ if (-not $vmXmlFiles) {
     exit 1
 }
 
-Write-Status -Message "Available backups for $selectedVmName:" -Color Green
+Write-Status -Message "Available backups for $($selectedVmName):" -Color Green
 for ($i = 0; $i -lt $vmXmlFiles.Count; $i++) {
     Write-Status -Message "[$i] $($vmXmlFiles[$i].Name)" -Color Yellow
 }
@@ -183,7 +183,9 @@ if (-not $vhdxFiles) {
 
 # Step 7 — Create NEW Hyper-V VM (never modify existing VM)
 $defaultNewName = "{0}_Restored" -f $vmInfo.Name
-$newVmName = Read-Host "Enter the NEW VM name" -Default $defaultNewName
+$namePrompt = "Enter the NEW VM name [press Enter for $defaultNewName]"
+$newVmName = Read-Host $namePrompt
+if ([string]::IsNullOrWhiteSpace($newVmName)) { $newVmName = $defaultNewName }
 
 if (Get-VM -Name $newVmName -ErrorAction SilentlyContinue) {
     Write-Status -Message "A VM named '$newVmName' already exists. Aborting to avoid overwrite." -Color Red
