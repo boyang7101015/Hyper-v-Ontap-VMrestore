@@ -1,342 +1,275 @@
-<#
+<#!
 .SYNOPSIS
-    Restores a Hyper-V virtual machine from a NetApp ONTAP FlexClone using saved XML metadata.
+    Restores a Hyper-V virtual machine from a NetApp ONTAP snapshot via FlexClone without overwriting existing VMs.
 .DESCRIPTION
-    Reads configuration exports from the VMConfigBackup folder, allows the operator to pick a VM
-    and configuration timestamp, provisions a FlexClone from a selected snapshot, mounts the data
-    via SMB, and rebuilds the VM as a brand-new instance without touching the original VM.
+    Loads a saved VM configuration XML from the centralized backup share, guides the operator through selecting
+    an ONTAP snapshot, provisions a FlexClone and SMB3 share, verifies VM files inside the clone, and builds a
+    brand-new Hyper-V VM with disks attached over SMB. The script never modifies existing VMs and offers optional
+    cleanup to remove the FlexClone and share when finished.
+.NOTES
+    Author: Automation generated
+    Requirements: Failover Clustering module, Hyper-V module, network access to ONTAP management LIF, access to SMB share
 #>
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
 
-# Prompt for required connection details
-$ClusterMgmt = Read-Host 'Enter cluster management IP or FQDN'
-$ONTAPUser = Read-Host 'Enter ONTAP username'
-$ONTAPPassword = Read-Host 'Enter ONTAP password' -AsSecureString
-$SourceVolume = Read-Host 'Enter ONTAP source volume hosting the VM folders'
-
-# Bypass TLS certificate validation as required
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+function Write-Status {
+    param(
+        [string]$Message,
+        [ValidateSet('Green','Yellow','Red')]
+        [string]$Color = 'Green'
+    )
+    Write-Host $Message -ForegroundColor $Color
+}
 
 function Convert-SecureStringToPlainText {
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [System.Security.SecureString]$SecureString
     )
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
     try {
-        return [System.Runtime.InteropServices.Marshal]::PtrToStringUni($bstr)
-    }
-    finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
     }
 }
 
-function Invoke-ONTAPRestRequest {
+# Shared backup path
+$backupRoot = "\\\\by-hyper-v.bylab.local\\vm_config_bk"
+
+# Prompt for required inputs
+$ClusterMgmt = Read-Host "Enter the ONTAP cluster management IP or FQDN"
+$ONTAPUser = Read-Host "Enter the ONTAP username"
+$ONTAPPassword = Read-Host "Enter the ONTAP password" -AsSecureString
+
+# Allow self-signed certificates
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+$plainPassword = Convert-SecureStringToPlainText -SecureString $ONTAPPassword
+$authHeader = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ONTAPUser:$plainPassword"))
+$baseUri = "https://$ClusterMgmt"
+
+function Invoke-OntapApi {
     param(
-        [Parameter(Mandatory = $true)][string]$Method,
-        [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][hashtable]$Headers,
-        [Parameter()][object]$Body,
-        [Parameter()][string]$Description
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][string]$Uri,
+        [string]$Body
     )
-
-    if ($Description) {
-        Write-Host $Description -ForegroundColor Yellow
-    }
-
     try {
-        if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-            $jsonBody = $Body | ConvertTo-Json -Depth 10
-            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -Body $jsonBody
-        } else {
-            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers
+        $params = @{
+            Method = $Method
+            Uri = $Uri
+            Headers = @{ Authorization = $authHeader }
+            ContentType = 'application/json'
         }
+        if ($Body) { $params['Body'] = $Body }
+
+        Write-Status -Message "Invoking ONTAP REST: $Method $Uri" -Color Green
+        return Invoke-RestMethod @params
     } catch {
-        Write-Host "REST call failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Status -Message "REST call failed: $_" -Color Red
         throw
     }
 }
 
-$plainPassword = Convert-SecureStringToPlainText -SecureString $ONTAPPassword
-$basicAuthBytes = [System.Text.Encoding]::UTF8.GetBytes("$ONTAPUser`:$plainPassword")
-$basicToken = [Convert]::ToBase64String($basicAuthBytes)
-$headers = @{
-    Authorization = "Basic $basicToken"
-    Accept = 'application/json'
-    'Content-Type' = 'application/json'
-}
-$baseUri = "https://$ClusterMgmt"
-
-# Locate backup folder and available XML files
-$scriptDirectory = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
-if (-not $scriptDirectory) { $scriptDirectory = Get-Location }
-$backupFolder = Join-Path -Path $scriptDirectory -ChildPath 'VMConfigBackup'
-
-if (-not (Test-Path -Path $backupFolder)) {
-    Write-Host "Backup folder '$backupFolder' does not exist." -ForegroundColor Red
-    throw 'No configuration backups were found.'
+# Step 1 — Select VM XML metadata
+if (-not (Test-Path -Path $backupRoot)) {
+    Write-Status -Message "Backup root '$backupRoot' is not accessible." -Color Red
+    exit 1
 }
 
-$xmlFiles = Get-ChildItem -Path $backupFolder -Filter '*.xml' -File
+$xmlFiles = Get-ChildItem -Path $backupRoot -Filter '*.xml' -Recurse
 if (-not $xmlFiles) {
-    Write-Host 'No XML configuration files found in the backup folder.' -ForegroundColor Red
-    throw 'No configuration backups available.'
+    Write-Status -Message "No backup XML files were found under $backupRoot." -Color Red
+    exit 1
 }
 
-$vmOptions = @()
-foreach ($file in $xmlFiles) {
-    try {
-        [xml]$xmlContent = Get-Content -Path $file.FullName
-        $vmName = $xmlContent.VM.Name
-        if ([string]::IsNullOrWhiteSpace($vmName)) { continue }
-        $vmOptions += [pscustomobject]@{ Name = $vmName; File = $file.FullName; Timestamp = $file.LastWriteTime }
-    } catch {
-        Write-Host "Failed to parse XML file '$($file.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
-    }
+$vmNames = $xmlFiles | ForEach-Object { $_.BaseName -replace '_\d{8}_\d{6}$','' } | Sort-Object -Unique
+Write-Status -Message "Available VMs: $($vmNames -join ', ')" -Color Green
+$selectedVmName = Read-Host "Enter the VM name to restore"
+
+$vmXmlFiles = $xmlFiles | Where-Object { $_.BaseName -like "${selectedVmName}_*" } | Sort-Object LastWriteTime -Descending
+if (-not $vmXmlFiles) {
+    Write-Status -Message "No backups found for VM '$selectedVmName'." -Color Red
+    exit 1
 }
 
-$distinctVmNames = $vmOptions.Name | Sort-Object -Unique
-if (-not $distinctVmNames) {
-    Write-Host 'No valid VM metadata entries were found.' -ForegroundColor Red
-    throw 'Metadata parsing failed.'
+Write-Status -Message "Available backups for $selectedVmName:" -Color Green
+for ($i = 0; $i -lt $vmXmlFiles.Count; $i++) {
+    Write-Status -Message "[$i] $($vmXmlFiles[$i].Name)" -Color Yellow
+}
+$selection = Read-Host "Enter the number of the backup to use"
+[int]$selectionValue = -1
+if (-not [int]::TryParse($selection, [ref]$selectionValue) -or $selectionValue -lt 0 -or $selectionValue -ge $vmXmlFiles.Count) {
+    Write-Status -Message "Invalid selection." -Color Red
+    exit 1
 }
 
-Write-Host 'Select the VM you want to restore:' -ForegroundColor Yellow
-for ($i = 0; $i -lt $distinctVmNames.Count; $i++) {
-    Write-Host ("[{0}] {1}" -f ($i + 1), $distinctVmNames[$i]) -ForegroundColor Green
+$chosenBackup = $vmXmlFiles[$selectionValue]
+Write-Status -Message "Using backup file $($chosenBackup.FullName)" -Color Green
+
+[xml]$vmConfig = Get-Content -Path $chosenBackup.FullName
+$vmInfo = $vmConfig.VM
+
+# Step 2 — Ask for ONTAP source volume
+$sourceVolume = Read-Host "Enter the ONTAP source volume name"
+
+# Step 3 — Select snapshot (after filtering)
+$volumeInfo = Invoke-OntapApi -Method 'GET' -Uri "$baseUri/api/storage/volumes?name=$sourceVolume"
+if (-not $volumeInfo.records -or -not $volumeInfo.records[0].uuid) {
+    Write-Status -Message "Unable to locate volume '$sourceVolume'." -Color Red
+    exit 1
+}
+$volumeUuid = $volumeInfo.records[0].uuid
+
+$snapshotsResponse = Invoke-OntapApi -Method 'GET' -Uri "$baseUri/api/storage/volumes/$volumeUuid/snapshots"
+$snapshots = $snapshotsResponse.records | Where-Object { $_.name -notlike 'vserver*' -and $_.name -notlike 'snapmirror*' }
+if (-not $snapshots) {
+    Write-Status -Message "No eligible snapshots found for volume '$sourceVolume'." -Color Red
+    exit 1
 }
 
-$vmSelection = $null
-while (-not ($vmSelection -and $vmSelection -ge 1 -and $vmSelection -le $distinctVmNames.Count)) {
-    $vmSelection = Read-Host 'Enter the number of the VM to restore'
-    [void][int]::TryParse($vmSelection, [ref]$vmSelection)
+Write-Status -Message "Available snapshots:" -Color Green
+for ($i = 0; $i -lt $snapshots.Count; $i++) {
+    Write-Status -Message "[$i] $($snapshots[$i].name)" -Color Yellow
 }
-$selectedVmName = $distinctVmNames[$vmSelection - 1]
+$snapshotSelection = Read-Host "Enter the number of the snapshot to use"
+[int]$snapshotValue = -1
+if (-not [int]::TryParse($snapshotSelection, [ref]$snapshotValue) -or $snapshotValue -lt 0 -or $snapshotValue -ge $snapshots.Count) {
+    Write-Status -Message "Invalid snapshot selection." -Color Red
+    exit 1
+}
+$selectedSnapshot = $snapshots[$snapshotValue].name
 
-$vmFiles = $vmOptions | Where-Object { $_.Name -eq $selectedVmName } | Sort-Object -Property Timestamp -Descending
-Write-Host "Select the configuration timestamp for '$selectedVmName':" -ForegroundColor Yellow
-for ($j = 0; $j -lt $vmFiles.Count; $j++) {
-    Write-Host ("[{0}] {1}" -f ($j + 1), (Get-Item $vmFiles[$j].File).Name) -ForegroundColor Green
-}
-
-$configSelection = $null
-while (-not ($configSelection -and $configSelection -ge 1 -and $configSelection -le $vmFiles.Count)) {
-    $configSelection = Read-Host 'Enter the number of the configuration file'
-    [void][int]::TryParse($configSelection, [ref]$configSelection)
-}
-$selectedConfigPath = $vmFiles[$configSelection - 1].File
-[xml]$vmConfig = Get-Content -Path $selectedConfigPath
-$vmData = $vmConfig.VM
-
-# Get volume UUID
-$encodedVolumeName = [System.Uri]::EscapeDataString($SourceVolume)
-$volumeUri = "$baseUri/api/storage/volumes?name=$encodedVolumeName"
-$volumeResponse = Invoke-ONTAPRestRequest -Method 'GET' -Uri $volumeUri -Headers $headers -Description "Retrieving UUID for volume '$SourceVolume'"
-if (-not $volumeResponse.records) {
-    Write-Host "Volume '$SourceVolume' was not found." -ForegroundColor Red
-    throw 'Invalid volume name.'
-}
-$volumeRecord = $volumeResponse.records | Select-Object -First 1
-$volumeUuid = $volumeRecord.uuid
-$svmName = $volumeRecord.svm.name
-
-# Get snapshots for the volume and filter unsupported names
-$snapshotUri = "$baseUri/api/storage/volumes/$volumeUuid/snapshots"
-$snapshotResponse = Invoke-ONTAPRestRequest -Method 'GET' -Uri $snapshotUri -Headers $headers -Description 'Retrieving snapshot list'
-$availableSnapshots = @()
-if ($snapshotResponse.records) {
-    $availableSnapshots = $snapshotResponse.records | Where-Object { ($_ .name -notlike 'vserver*') -and ($_ .name -notlike 'snapmirror*') }
-}
-
-if (-not $availableSnapshots) {
-    Write-Host 'No valid snapshots were returned for the specified volume.' -ForegroundColor Red
-    throw 'Snapshot selection failed.'
-}
-
-Write-Host 'Select the snapshot to FlexClone:' -ForegroundColor Yellow
-for ($k = 0; $k -lt $availableSnapshots.Count; $k++) {
-    $snapshotName = $availableSnapshots[$k].name
-    $snapshotTime = $availableSnapshots[$k].create_time
-    Write-Host ("[{0}] {1} - {2}" -f ($k + 1), $snapshotName, $snapshotTime) -ForegroundColor Green
-}
-$snapshotSelection = $null
-while (-not ($snapshotSelection -and $snapshotSelection -ge 1 -and $snapshotSelection -le $availableSnapshots.Count)) {
-    $snapshotSelection = Read-Host 'Enter the number of the snapshot'
-    [void][int]::TryParse($snapshotSelection, [ref]$snapshotSelection)
-}
-$selectedSnapshot = $availableSnapshots[$snapshotSelection - 1]
-
-# Create FlexClone
-$cloneName = "{0}_clone_{1}" -f $SourceVolume, (Get-Date).ToString('fff')
+# Step 4 — Create FlexClone volume
+$cloneSuffix = (Get-Date).ToString('fff')
+$cloneName = "{0}_clone_{1}" -f $sourceVolume, $cloneSuffix
 $cloneBody = @{
     name = $cloneName
-    clone = @{
-        parent_volume = @{ name = $SourceVolume }
-        parent_snapshot = @{ name = $selectedSnapshot.name }
-    }
+    clone = @{ parent_volume = @{ name = $sourceVolume }; parent_snapshot = @{ name = $selectedSnapshot } }
     nas = @{ path = "/$cloneName" }
-}
-$cloneResponse = Invoke-ONTAPRestRequest -Method 'POST' -Uri "$baseUri/api/storage/volumes" -Headers $headers -Body $cloneBody -Description "Creating FlexClone '$cloneName'"
+} | ConvertTo-Json -Depth 5
+
+$cloneResponse = Invoke-OntapApi -Method 'POST' -Uri "$baseUri/api/storage/volumes" -Body $cloneBody
 $cloneUuid = $cloneResponse.uuid
 if (-not $cloneUuid) {
-    Write-Host 'Failed to obtain FlexClone UUID from the response.' -ForegroundColor Red
-    throw 'FlexClone creation failed.'
+    Write-Status -Message "FlexClone creation did not return a UUID." -Color Red
+    exit 1
 }
+Write-Status -Message "Created FlexClone '$cloneName' with UUID $cloneUuid" -Color Green
 
-# Create SMB share for clone
+# Step 5 — Create SMB3 share for FlexClone
 $shareName = "clone_$cloneName"
-$shareBody = @{
-    name = $shareName
-    path = "/$cloneName"
-    svm = @{ name = $svmName }
-}
-$shareResponse = Invoke-ONTAPRestRequest -Method 'POST' -Uri "$baseUri/api/protocols/smb/shares" -Headers $headers -Body $shareBody -Description "Creating SMB share '$shareName'"
+$shareBody = @{ name = $shareName; path = "/$cloneName" } | ConvertTo-Json -Depth 5
+$shareResponse = Invoke-OntapApi -Method 'POST' -Uri "$baseUri/api/protocols/smb/shares" -Body $shareBody
 $shareUuid = $shareResponse.uuid
-if (-not $shareUuid) {
-    Write-Host 'Failed to obtain SMB share UUID from the response.' -ForegroundColor Red
-    throw 'SMB share creation failed.'
+Write-Status -Message "Created SMB share '$shareName'" -Color Green
+
+# Step 6 — Locate VM folder in FlexClone
+$vmFolder = "\\\\$ClusterMgmt\\$shareName\\$($vmInfo.Name)"
+if (-not (Test-Path -Path $vmFolder)) {
+    Write-Status -Message "VM folder '$vmFolder' not found in clone." -Color Red
+    exit 1
 }
 
-$sharePath = "\\$svmName\$shareName"
-$vmFolderPath = Join-Path -Path $sharePath -ChildPath $selectedVmName
-
-if (-not (Test-Path -Path $vmFolderPath)) {
-    Write-Host "VM folder '$vmFolderPath' was not found on the FlexClone." -ForegroundColor Red
-    throw 'VM data folder missing on FlexClone.'
-}
-
-$vhdxFiles = Get-ChildItem -Path $vmFolderPath -Filter '*.vhdx' -File -Recurse
+$vhdxFiles = Get-ChildItem -Path $vmFolder -Filter '*.vhdx' -Recurse
 if (-not $vhdxFiles) {
-    Write-Host 'No VHDX files were discovered inside the VM folder.' -ForegroundColor Red
-    throw 'No disks found on FlexClone.'
-}
-$vhdxLookup = @{}
-foreach ($diskFile in $vhdxFiles) {
-    $vhdxLookup[$diskFile.Name.ToLower()] = $diskFile.FullName
+    Write-Status -Message "No VHDX files were found under '$vmFolder'." -Color Red
+    exit 1
 }
 
-# Prepare VM creation parameters
-$originalVmName = $vmData.Name
-$targetVmName = $originalVmName
-if (Get-VM -Name $targetVmName -ErrorAction SilentlyContinue) {
-    $targetVmName = "{0}-Restore-{1}" -f $originalVmName, (Get-Date).ToString('yyyyMMddHHmmss')
-    Write-Host "Existing VM named '$originalVmName' detected. New VM will be created as '$targetVmName'." -ForegroundColor Yellow
+# Step 7 — Create NEW Hyper-V VM (never modify existing VM)
+$defaultNewName = "{0}_Restored" -f $vmInfo.Name
+$newVmName = Read-Host "Enter the NEW VM name" -Default $defaultNewName
+
+if (Get-VM -Name $newVmName -ErrorAction SilentlyContinue) {
+    Write-Status -Message "A VM named '$newVmName' already exists. Aborting to avoid overwrite." -Color Red
+    exit 1
 }
 
-$vmGeneration = [int]$vmData.Generation
-$memoryStartupBytes = [int64]$vmData.MemoryStartupBytes
-$cpuCount = [int]$vmData.CPU
-$dynamicMemoryEnabled = [System.Convert]::ToBoolean($vmData.DynamicMemoryEnabled)
-$memoryMinBytes = [int64]$vmData.DynamicMemoryMinBytes
-$memoryMaxBytes = [int64]$vmData.DynamicMemoryMaxBytes
-
-Write-Host "Creating new VM '$targetVmName'" -ForegroundColor Yellow
-$null = New-VM -Name $targetVmName -Generation $vmGeneration -MemoryStartupBytes $memoryStartupBytes -NoVHD
-Set-VMProcessor -VMName $targetVmName -Count $cpuCount
-Set-VMMemory -VMName $targetVmName -DynamicMemoryEnabled:$dynamicMemoryEnabled -MinimumBytes $memoryMinBytes -MaximumBytes $memoryMaxBytes -StartupBytes $memoryStartupBytes
-
-# Rebuild network configuration
-Get-VMNetworkAdapter -VMName $targetVmName | ForEach-Object { Remove-VMNetworkAdapter -VMNetworkAdapter $_ }
-
-$networkAdapters = @()
-if ($vmData.NetworkAdapters.Adapter) {
-    if ($vmData.NetworkAdapters.Adapter -is [System.Array]) {
-        $networkAdapters = $vmData.NetworkAdapters.Adapter
-    } else {
-        $networkAdapters = @($vmData.NetworkAdapters.Adapter)
-    }
+$newVmParams = @{
+    Name = $newVmName
+    Generation = [int]$vmInfo.Generation
+    MemoryStartupBytes = [int64]$vmInfo.MemoryStartupBytes
+    NoVHD = $true
 }
 
-foreach ($adapter in $networkAdapters) {
+Write-Status -Message "Creating new VM '$newVmName'" -Color Green
+$newVm = New-VM @newVmParams
+
+if ($vmInfo.DynamicMemoryEnabled -eq 'True') {
+    Set-VMMemory -VMName $newVmName -DynamicMemoryEnabled $true -MinimumBytes ([int64]$vmInfo.DynamicMemoryMinBytes) -MaximumBytes ([int64]$vmInfo.DynamicMemoryMaxBytes)
+} else {
+    Set-VMMemory -VMName $newVmName -DynamicMemoryEnabled $false -StartupBytes ([int64]$vmInfo.MemoryStartupBytes)
+}
+
+Set-VMProcessor -VMName $newVmName -Count ([int]$vmInfo.CPU)
+
+# Configure network adapters
+foreach ($adapter in $vmInfo.NetworkAdapters.Adapter) {
+    $adapterName = $adapter.Name
     $switchName = $adapter.SwitchName
-    try {
-        $null = Get-VMSwitch -Name $switchName -ErrorAction Stop
-    } catch {
-        Write-Host "Virtual switch '$switchName' was not found. Skipping adapter '$($adapter.Name)'." -ForegroundColor Yellow
-        continue
-    }
+    $mac = $adapter.MacAddress
+    $vlan = [string]$adapter.VLAN
 
-    $newAdapter = Add-VMNetworkAdapter -VMName $targetVmName -SwitchName $switchName -Name $adapter.Name
-    if (-not [string]::IsNullOrWhiteSpace($adapter.MacAddress)) {
-        Set-VMNetworkAdapter -VMNetworkAdapter $newAdapter -StaticMacAddress $adapter.MacAddress
-    }
+    $createdAdapter = Add-VMNetworkAdapter -VMName $newVmName -Name $adapterName -SwitchName $switchName
+    if ($mac) { Set-VMNetworkAdapter -VMNetworkAdapter $createdAdapter -StaticMacAddress $mac }
 
-    if (-not [string]::IsNullOrWhiteSpace($adapter.VLAN)) {
-        if ($adapter.VLAN -match ',') {
-            Set-VMNetworkAdapterVlan -VMNetworkAdapter $newAdapter -Trunk -AllowedVlanIdList $adapter.VLAN
+    if ($vlan) {
+        if ($vlan -like '*,*' -or $vlan -match ',') {
+            $allowed = $vlan -split ',' | ForEach-Object { [int]$_ }
+            Set-VMNetworkAdapterVlan -VMNetworkAdapter $createdAdapter -Trunk -AllowedVlanIdList $allowed -NativeVlanId 0
         } else {
-            $vlanId = 0
-            if ([int]::TryParse($adapter.VLAN, [ref]$vlanId) -and $vlanId -gt 0) {
-                Set-VMNetworkAdapterVlan -VMNetworkAdapter $newAdapter -Access -VlanId $vlanId
-            }
+            Set-VMNetworkAdapterVlan -VMNetworkAdapter $createdAdapter -Access -VlanId ([int]$vlan)
         }
     }
 }
 
-# Attach disks from FlexClone
-$diskEntries = @()
-if ($vmData.Disks.Disk) {
-    if ($vmData.Disks.Disk -is [System.Array]) {
-        $diskEntries = $vmData.Disks.Disk
-    } else {
-        $diskEntries = @($vmData.Disks.Disk)
-    }
-}
+# Attach disks from clone
+foreach ($disk in $vmInfo.Disks.Disk) {
+    $leaf = Split-Path -Path $disk.Path -Leaf
+    $candidatePath = Join-Path -Path $vmFolder -ChildPath $leaf
 
-foreach ($diskEntry in $diskEntries) {
-    $controllerType = $diskEntry.ControllerType
-    $controllerLocationValue = $diskEntry.ControllerLocation
-    $controllerNumber = 0
-    $controllerSlot = 0
-
-    if ($controllerLocationValue -match ':') {
-        $parts = $controllerLocationValue -split ':'
-        if ($parts.Count -ge 2) {
-            [void][int]::TryParse($parts[0], [ref]$controllerNumber)
-            [void][int]::TryParse($parts[1], [ref]$controllerSlot)
-        }
-    } else {
-        [void][int]::TryParse($controllerLocationValue, [ref]$controllerSlot)
+    $fileToUse = $candidatePath
+    if (-not (Test-Path -Path $candidatePath)) {
+        $found = Get-ChildItem -Path $vmFolder -Filter $leaf -Recurse | Select-Object -First 1
+        if ($found) { $fileToUse = $found.FullName }
     }
 
-    $originalDiskPath = $diskEntry.Path
-    $diskFileName = Split-Path -Path $originalDiskPath -Leaf
-    $lowerName = $diskFileName.ToLower()
-    $resolvedDiskPath = $null
-    if ($vhdxLookup.ContainsKey($lowerName)) {
-        $resolvedDiskPath = $vhdxLookup[$lowerName]
-    } else {
-        $fallbackPath = Join-Path -Path $vmFolderPath -ChildPath $diskFileName
-        if (Test-Path -Path $fallbackPath) {
-            $resolvedDiskPath = $fallbackPath
-        }
-    }
-
-    if (-not $resolvedDiskPath) {
-        Write-Host "Disk file '$diskFileName' could not be located on the FlexClone. Skipping this disk." -ForegroundColor Yellow
+    if (-not (Test-Path -Path $fileToUse)) {
+        Write-Status -Message "Unable to locate disk '$leaf' for attachment." -Color Red
         continue
     }
 
-    Write-Host "Attaching disk '$diskFileName' from '$resolvedDiskPath'" -ForegroundColor Green
-    Add-VMHardDiskDrive -VMName $targetVmName -ControllerType $controllerType -ControllerNumber $controllerNumber -ControllerLocation $controllerSlot -Path $resolvedDiskPath
+    Write-Status -Message "Attaching VHDX '$fileToUse'" -Color Green
+    Add-VMHardDiskDrive -VMName $newVmName -Path $fileToUse -ControllerType $disk.ControllerType -ControllerLocation ([int]$disk.ControllerLocation)
 }
 
-Write-Host 'Restore complete. Please verify that the VM boots successfully.' -ForegroundColor Green
+Write-Status -Message "Restore complete. Please verify that the VM boots successfully." -Color Green
 
-# Optional cleanup
-$cleanupChoice = Read-Host "Do you want to delete the FlexClone volume? Please confirm that no virtual machines are currently running on this volume. (Y/N)"
-if ($cleanupChoice -match '^[Yy]') {
-    if ($shareUuid) {
-        Invoke-ONTAPRestRequest -Method 'DELETE' -Uri "$baseUri/api/protocols/smb/shares/$shareUuid" -Headers $headers -Description "Deleting SMB share '$shareName'" | Out-Null
-        Write-Host "SMB share '$shareName' deleted." -ForegroundColor Green
+# Step 9 — Optional cleanup
+$cleanupChoice = Read-Host "Do you want to delete the FlexClone volume? Please confirm that no virtual machines are currently running on this volume. (Yes/No)"
+if ($cleanupChoice -match '^(Yes|Y)$') {
+    Write-Status -Message "Removing SMB share '$shareName'" -Color Yellow
+    try {
+        $shareLookup = Invoke-OntapApi -Method 'GET' -Uri "$baseUri/api/protocols/smb/shares?name=$shareName"
+        if ($shareLookup.records -and $shareLookup.records[0].uuid) {
+            Invoke-OntapApi -Method 'DELETE' -Uri "$baseUri/api/protocols/smb/shares/$($shareLookup.records[0].uuid)"
+        }
+    } catch {
+        Write-Status -Message "Failed to remove SMB share: $_" -Color Red
     }
-    if ($cloneUuid) {
-        Invoke-ONTAPRestRequest -Method 'DELETE' -Uri "$baseUri/api/storage/volumes/$cloneUuid" -Headers $headers -Description "Deleting FlexClone '$cloneName'" | Out-Null
-        Write-Host "FlexClone '$cloneName' deleted." -ForegroundColor Green
+
+    Write-Status -Message "Deleting FlexClone volume '$cloneName'" -Color Yellow
+    try {
+        Invoke-OntapApi -Method 'DELETE' -Uri "$baseUri/api/storage/volumes/$cloneUuid"
+        Write-Status -Message "FlexClone deleted." -Color Green
+    } catch {
+        Write-Status -Message "Failed to delete FlexClone: $_" -Color Red
     }
 } else {
-    Write-Host 'FlexClone has been retained as requested.' -ForegroundColor Yellow
+    Write-Status -Message "FlexClone retained as requested." -Color Yellow
 }
