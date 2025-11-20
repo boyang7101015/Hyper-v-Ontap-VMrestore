@@ -45,8 +45,19 @@ $ClusterMgmt = Read-Host "Enter the ONTAP cluster management IP or FQDN"
 $ONTAPUser = Read-Host "Enter the ONTAP username"
 $ONTAPPassword = Read-Host "Enter the ONTAP password" -AsSecureString
 
-# Allow self-signed certificates
+# Allow self-signed certificates and enforce modern TLS (common cause of "unexpected error on send")
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+[System.Net.ServicePointManager]::Expect100Continue = $false
+try {
+    $tlsCandidates = @('Tls13','Tls12','Tls11','Tls') | ForEach-Object { [Net.SecurityProtocolType]::$_ } 2>$null
+    if ($tlsCandidates) {
+        $protocolMask = 0
+        foreach ($candidate in $tlsCandidates) { $protocolMask = $protocolMask -bor $candidate }
+        [System.Net.ServicePointManager]::SecurityProtocol = $protocolMask
+    }
+} catch {
+    Write-Status -Message "Unable to set TLS protocol preferences: $_" -Color Yellow
+}
 
 $plainPassword = Convert-SecureStringToPlainText -SecureString $ONTAPPassword
 $authHeader = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($ONTAPUser):$plainPassword"))
@@ -62,7 +73,7 @@ function Invoke-OntapApi {
         $params = @{
             Method = $Method
             Uri = $Uri
-            Headers = @{ Authorization = $authHeader }
+            Headers = @{ Authorization = $authHeader; Accept = 'application/json' }
             ContentType = 'application/json'
         }
         if ($Body) { $params['Body'] = $Body }
